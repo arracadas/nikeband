@@ -1,0 +1,238 @@
+---
+title: "Improving Health with Activity Recognition Devices"
+author: "arracadas"
+date: "09/19/2014"
+output: html_document
+---
+
+### Synopsis
+Using devices such as Jawbone Up, Nike FuelBand, and Fitbit it is now possible to collect a large amount of data about personal activity and use it to improve personal health.  However, people regularly quantify how much of a particular activity they do, but they rarely quantify how well they do it.  In this project I take activity data to detect how well people perform barbell lifts. For information about the original study see: http://groupware.les.inf.puc-rio.br/har (see the section on the Weight Lifting Exercise Dataset). 
+
+My approach starts with data pre-processing to extract relevant features for the model and exploratory data analysis (EDA) to identify highly skewed and highly correlated covariates. To predict class outcomes I build a random forest model and use bootstrapping cross validation with 30 resampling iterations.  I use accuracy as the measure of error and results from the final model show an out-of-sample accuracy of 99%. The model performs very well!
+
+### Data Field Description
+Class A corresponds to the specified execution of the exercise, while the other 4 classes correspond to common mistakes.  For each observation there are 96 features including Euler angles (roll, pitch and yaw), as well as accelorometer, gyroscope and magnetometer readings and corresponding statistical measures such as variance and standard deviation.
+
+### Approach
+First I load the data set "pml-training.csv" and use the createDataPartition function to split it in two: training (75%) and testing (25%). After splitting I do some basic transformations like converting categorical variables to factors.  Then I strart my initial EDA by looking at the distribution of activity across classes and users (as % of total).
+
+
+```{r, echo=FALSE, results= "hide"}
+library(caret)
+library(gtools)  # for invalid function
+library(lubridate)
+
+# Load training set
+train <- read.csv("~/Documents/JHU Machine/peer_assessment/pml-training.csv"
+                  ,header = TRUE
+                  ,stringsAsFactors = FALSE
+                  ,na.strings = c("NA","","#DIV/0!")
+)
+
+# Load testing data set
+ts <- read.csv("~/Documents/JHU Machine/peer_assessment/pml-testing.csv"
+               ,header = TRUE
+               ,stringsAsFactors = FALSE
+               ,na.strings = c("NA","","#DIV/0!")
+)
+```
+
+```{r, echo=FALSE, results= "hide"} 
+# add factors
+train$classe <- factor(train$classe)
+train$user_name <- factor(train$user_name) 
+ts$user_name <- factor(ts$user_name)
+
+# add dates
+train$cvtd_timestamp <- mdy_hm(train$cvtd_timestamp)
+ts$cvtd_timestamp <- mdy_hm(ts$cvtd_timestamp)
+
+```
+
+```{r}
+# split training data set into training and testing
+inTrain <- createDataPartition(y = train$classe
+                               ,p = 0.75
+                               ,list = FALSE)
+
+tr <- train[inTrain,]
+tv <- train[-inTrain,]
+```
+
+
+```{r, echo=FALSE}
+round(prop.table(table(tr$user_name
+                       ,tr$classe)
+                 ,1)*100
+      ,digits = 2
+)
+```
+
+
+During EDA I look for covariates with a large number of NAs.  There are many of them so I create a rule to eliminate all those with > 90% of NA values.  In addition, I check for covariates with near zero-variance.  And before I forget, data is not very clean, so values like "#DIV/0!" can cause trouble, so I clean them.  
+
+Here I show some of the covariates with high % of NA values (see column valT):
+
+
+```{r, echo=FALSE, results="hide"}
+# identify variables with NA values
+# list of columns and vectors
+cn <- colnames(tr)
+vT <- as.numeric()
+vF <- as.numeric()
+
+# check every column and fill in vectors
+for (i in seq_along(cn)) {
+      prop <- prop.table(table(is.na(tr[,i])))*100
+      prop <- round(prop
+                    ,digits = 2)
+      prop <- as.data.frame(prop)
+      valF <- ifelse(invalid(prop[prop$Var1 == FALSE, 2])
+            ,0
+            ,prop[prop$Var1 == FALSE, 2]
+      )
+      valT <- ifelse(invalid(prop[prop$Var1 == TRUE, 2])
+            ,0
+            ,prop[prop$Var1 == TRUE, 2]
+      )
+      vF <- c(vF, valF)
+      vT <- c(vT, valT)
+}
+
+# build data frame
+cnna <- data.frame(var = cn
+                   ,valF = vF
+                   ,valT = vT
+)
+
+```
+
+```{r, echo=FALSE}
+cnna[20:25,]
+```
+
+```{r, echo=FALSE, results="hide"}
+# eliminate variables with > 90% of NA
+indx_cnna <- which(cnna$valT > 90)
+
+# now subset list of columns
+tr1 <- tr[,-indx_cnna]
+tv1 <- tv[,-indx_cnna]
+ts1 <- ts[,-indx_cnna]
+```
+
+
+Here I check for near zero-variance. 
+
+
+```{r}
+trnz <- nearZeroVar(tr1
+                    ,saveMetrics = TRUE)
+```
+
+
+So far I have eliminated more than half of the covariates but there are still more than 50 left.  With that many, I suspect some are highly correlated, so I use the findCorrelation() function to identify them.
+
+
+```{r}
+# check correlations between numeric covariates
+tr1co <- cor(tr1[,-c(1,2,5,6,60)])
+
+# find those with correlations > 0.8
+highc <- findCorrelation(tr1co
+                         ,cutoff = 0.8)
+```
+
+
+Then I remove them.
+
+
+```{r}
+# remove highly correlated covariates
+tr1 <- tr1[,-highc]
+```
+
+
+At his point, I am down to about 40 covariates.  Now I go check for highly skewed covariates by creating some plots. For instance:
+
+
+```{r, echo=FALSE, results="hide"}
+# remove highly correlated variables
+# tr1 <- tr1[,-highc]
+tv1 <- tv1[,-highc]
+ts1 <- ts1[,-highc]
+```
+
+
+```{r, echo=FALSE}
+hist(tr1$yaw_belt
+     ,main = "yaw_belt")
+```
+
+```{r, echo=FALSE}
+hist(tr1$magnet_forearm_x 
+     ,main = "magnet_forearm_x")
+```
+
+
+After exploring a few variables some of them seem to be highly skewed so I decide to center and scale all numeric covariates with the preProcess() function.  I use the pre-process object to process both my training and testing data sets.
+
+
+```{r}
+preObj <- preProcess(tr1[,-c(1,2,4,5,48)]
+                     ,method = c("center", "scale")
+                     )
+
+tr2 <- predict(preObj 
+               ,tr1[,-c(1,2,4,5,48)])  # apply to training
+
+tv2 <- predict(preObj
+               ,tv1[,-c(1,2,4,5,48)])  # apply to testing
+```
+
+```{r, echo=FALSE}
+# tr2 <- predict(preObj 
+#                ,tr1[,-c(1,2,4,5,48)])  # apply to training
+
+# tv2 <- predict(preObj
+#                ,tv1[,-c(1,2,4,5,48)])  # apply to validation
+
+ts2 <- predict(preObj 
+               ,ts1[,-c(1,2,4,5,48)]) # apply to testing
+```
+
+
+After centering and scaling covariates I build a random forest predictive model.  I start by tuning the model using bootstrap method with 30 resampling iterations. Processing the random forest tree takes time, so a bigger sample could make it very slow.  Notice that bootsrap is the default method in the trainControl() function, so I just need to specify the number of resampling iterations.
+
+
+```{r}
+bootControl <- trainControl(number = 30)
+
+set.seed(1357)
+rf.Fit <- train(tr2
+                ,tr1$classe
+                ,method = "rf"
+                ,trControl = bootControl)
+
+rf.Fit
+```
+
+
+Then I calculate the predicted outcomes using the testing data set.
+
+
+```{r}
+rf.predtv <- predict(rf.Fit$finalModel
+                      ,newdata = tv2)  ## use testing data set
+```
+
+
+And finally I use the confusion matrix to check the estimated out of sample error (sometimes called generalization error).  In this case I pick Accuracy to measure the performance of the model.  In the Overall Statistics section it shows that estimated out of sample Accuracy is 99%.
+
+
+```{r}
+confusionMatrix(rf.predtv
+                ,tv$classe)
+```
+
+
